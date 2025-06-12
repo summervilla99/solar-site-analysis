@@ -1,0 +1,9 @@
+streamlit
+pandas
+requests
+folium
+selenium
+openai
+PyMuPDF
+pytesseract
+langchain
