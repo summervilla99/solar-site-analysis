@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>입지 적합도 지도</title>
+  <script type="text/javascript" src="//dapi.kakao.com/v2/maps/sdk.js?appkey=7b366f17cee64bfeff0847bf87a8c5ff"></script>
+</head>
+<body>
+<div id="map" style="width:100%; height:500px;"></div>
+
+<script>
+  // 적합도 예시 (나중에 Python에서 실제 데이터로 삽입 가능)
+  const markerData = [
+    { lat: 37.5665, lng: 126.9780, label: "적합", score: "high" },
+    { lat: 37.5640, lng: 126.9768, label: "보통", score: "medium" },
+    { lat: 37.5655, lng: 126.9820, label: "부적합", score: "low" }
+  ];
+
+  const colorMap = {
+    high: "green",
+    medium: "orange",
+    low: "red"
+  };
+
+  const mapContainer = document.getElementById("map");
+  const mapOption = {
+    center: new kakao.maps.LatLng(37.5665, 126.9780),
+    level: 3
+  };
+  const map = new kakao.maps.Map(mapContainer, mapOption);
+
+    kakao.maps.event.addListener(map, 'click', function(mouseEvent) {
+        var lat = mouseEvent.latLng.getLat();
+        var lng = mouseEvent.latLng.getLng();
+        window._clickedCoords = { lat: lat, lng: lng };  // streamlit-js-eval용
+    });
+
+  markerData.forEach(item => {
+    const latlng = new kakao.maps.LatLng(item.lat, item.lng);
+
+    // 원형 마커 스타일 (색상 반영)
+    const circle = new kakao.maps.Circle({
+      center: latlng,
+      radius: 20,
+      strokeWeight: 2,
+      strokeColor: colorMap[item.score],
+      strokeOpacity: 1,
+      fillColor: colorMap[item.score],
+      fillOpacity: 0.7,
+      map: map
+    });
+
+    const overlay = new kakao.maps.CustomOverlay({
+      content: `<div style='padding:5px 10px;background:white;border:1px solid #999;'>${item.label}</div>`,
+      position: latlng,
+      yAnchor: 2.2
+    });
+
+    kakao.maps.event.addListener(circle, 'click', function() {
+      overlay.setMap(map);
+
+      // 부모창에 좌표 postMessage (Streamlit에 보낼 수 있음)
+      window.parent.postMessage(
+        JSON.stringify({ lat: item.lat, lng: item.lng, label: item.label }),
+        "*"
+      );
+    });
+  });
+</script>
+</body>
+</html>
