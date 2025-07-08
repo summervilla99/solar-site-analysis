@@ -1,11 +1,10 @@
 import streamlit as st
-import pandas as pd
 import requests
 import folium
 import json
 import os
 from streamlit_folium import st_folium
-from config import VWORLD_KEY
+from config import VWORLD_KEY  # API 키는 config.py에 따로 보관
 
 # ---------------- 기본 설정 ----------------
 DEFAULT_CENTER = [37.5665, 126.9780]
@@ -57,17 +56,26 @@ def geocode_cached(addr):
         save_geocode_cache(geocode_cache)
     return coords
 
-
-# ---------------- CSV 로딩 ----------------
-@st.cache_data
-def load_landuse_csv():
-    df = pd.read_csv("지목정보_20250701.csv", encoding="cp949")
-    df = df[["법정동명", "지번", "지목"]]
-    df["LOCATION_NAME"] = df["법정동명"].astype(str) + " " + df["지번"].astype(str)
-    df = df.rename(columns={"지목": "JIMOK"})
-    return df[["LOCATION_NAME", "JIMOK"]]
-
-df_land = load_landuse_csv()
+# ---------------- 지적도 WFS API 호출 ----------------
+def fetch_cadastral_features(lat, lng):
+    buffer = 0.001  # 약 100m 반경
+    bbox = f"{lng - buffer},{lat - buffer},{lng + buffer},{lat + buffer},EPSG:4326"
+    params = {
+        "service": "WFS",
+        "version": "2.0.0",
+        "request": "GetFeature",
+        "typename": "lt_cad_dg",
+        "bbox": bbox,
+        "output": "json",
+        "key": VWORLD_KEY
+    }
+    try:
+        res = requests.get("https://api.vworld.kr/req/wfs", params=params, timeout=5)
+        data = res.json()
+        return data.get("features", [])
+    except Exception as e:
+        st.error(f"❌ WFS API 오류: {e}")
+        return []
 
 # ---------------- 세션 상태 초기화 ----------------
 if "map_center" not in st.session_state:
@@ -99,37 +107,37 @@ if addr:
     else:
         st.error("❌ 주소 좌표를 찾을 수 없습니다.")
 
-
 # ---------------- 지도 생성 ----------------
 m = folium.Map(location=st.session_state.map_center, zoom_start=15)
-tile_url = f"http://api.vworld.kr/req/wmts/1.0.0/{VWORLD_KEY}/Base/{{z}}/{{y}}/{{x}}.png"
+tile_url = f"https://api.vworld.kr/req/wmts/1.0.0/{VWORLD_KEY}/Base/{{z}}/{{y}}/{{x}}.png"
 folium.TileLayer(tiles=tile_url, attr="VWorld").add_to(m)
 
 # ---------------- 지목 필터링 및 시각화 ----------------
 if st.session_state.search_coords:
     lat, lng = st.session_state.search_coords
-    keyword = addr.split()[1] if len(addr.split()) > 1 else addr
+    features = fetch_cadastral_features(lat, lng)
 
-    nearby = df_land[df_land["LOCATION_NAME"].str.contains(keyword, na=False)]
-
-    if nearby.empty:
-        st.warning("⚠️ 해당 주소 근처에 지목 데이터가 없습니다.")
+    if not features:
+        st.warning("⚠️ 해당 주소 근처에 필지 데이터가 없습니다.")
     else:
-        for _, row in nearby.iterrows():
-            location = row["LOCATION_NAME"]
-            jimok = row["JIMOK"]
+        for feature in features:
+            props = feature.get("properties", {})
+            geom = feature.get("geometry", {})
+            jimok = props.get("jimok", "")
+
             if jimok not in selected_disallowed:
                 continue
 
-            coord = geocode_cached(location)
-            if coord:
-                folium.Circle(
-                    location=coord,
-                    radius=50,
+            if geom.get("type") == "Polygon":
+                coords = geom["coordinates"][0]  # 외곽 폴리곤만 사용
+                coords = [[y, x] for x, y in coords]  # GeoJSON → Folium 좌표 순서 변환
+
+                folium.Polygon(
+                    locations=coords,
                     color="gray",
                     fill=True,
-                    fill_opacity=0.4,
-                    tooltip=f"❌ {location} - {jimok} (설치 불가)"
+                    fill_opacity=0.5,
+                    tooltip=f"❌ {props.get('juso', '주소 없음')} - {jimok}"
                 ).add_to(m)
 
 # ---------------- 지도 출력 ----------------
