@@ -1,31 +1,36 @@
 import streamlit as st
-import pandas as pd
-import requests
 import folium
+import psycopg2
 import json
-import os
+import re
 from streamlit_folium import st_folium
-from config import VWORLD_KEY
+from config import DB_HOST, DB_NAME, DB_USER, DB_PASS, DB_PORT, VWORLD_KEY
 
-# ---------------- 기본 설정 ----------------
-DEFAULT_CENTER = [37.5665, 126.9780]
+# 기본 설정
+DEFAULT_CENTER = [36.9910, 127.9260]  # 충주시 중심 좌표
 ALL_DISALLOWED_JIMOK = ["전", "답", "과", "염전", "임야", "양어장"]
 
-# ---------------- 캐시 로딩/저장 ----------------
-def load_geocode_cache():
-    if os.path.exists("geocode_cache.json"):
-        with open("geocode_cache.json", "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+# 세션 상태 초기화
+if 'map_center' not in st.session_state:
+    st.session_state.map_center = DEFAULT_CENTER
+if 'search_coords' not in st.session_state:
+    st.session_state.search_coords = None
+if 'search_triggered' not in st.session_state:
+    st.session_state.search_triggered = False
+if 'filtered_data' not in st.session_state:
+    st.session_state.filtered_data = None
 
-def save_geocode_cache(cache):
-    with open("geocode_cache.json", "w", encoding="utf-8") as f:
-        json.dump(cache, f, ensure_ascii=False, indent=2)
+st.title("\u2600\ufe0f Solar Site Analysis (DB 기반 지목 필터링)")
+selected_disallowed = st.sidebar.multiselect("🛑 태양광 불가 지목 선택", ALL_DISALLOWED_JIMOK, default=ALL_DISALLOWED_JIMOK)
 
-geocode_cache = load_geocode_cache()
+# 주소 입력 및 검색
+with st.form("search_form"):
+    addr = st.text_input("📍 주소 입력", key="address_input")
+    submitted = st.form_submit_button("🔍 검색")
 
-# ---------------- 주소 → 좌표 변환 ----------------
+# 주소 → 좌표 변환
 def geocode_address(addr):
+    import requests
     for addr_type in ["road", "parcel"]:
         params = {
             "service": "address",
@@ -40,97 +45,112 @@ def geocode_address(addr):
             data = res.json()
             if data["response"]["status"] == "OK":
                 point = data["response"]["result"]["point"]
-                x = float(point["x"])
-                y = float(point["y"])
-                return [y, x]
+                return [float(point["y"]), float(point["x"])]
         except:
             continue
     return None
 
-# ---------------- 캐시 우선 지오코딩 ----------------
-def geocode_cached(addr):
-    if addr in geocode_cache:
-        return geocode_cache[addr]
-    coords = geocode_address(addr)
-    if coords:
-        geocode_cache[addr] = coords
-        save_geocode_cache(geocode_cache)
-    return coords
+# 지목 추출 함수
+def extract_jimok(jibun_value):
+    if jibun_value:
+        match = re.search(r'([가-힣]{1,3})$', jibun_value.strip())
+        if match:
+            return match.group(1)
+    return ""
 
+# DB 쿼리 함수 (데이터만 반환)
+def query_features(lat, lng):
+    try:
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASS,
+            port=DB_PORT
+        )
+        cur = conn.cursor()
 
-# ---------------- CSV 로딩 ----------------
-@st.cache_data
-def load_landuse_csv():
-    df = pd.read_csv("지목정보_20250701.csv", encoding="cp949")
-    df = df[["법정동명", "지번", "지목"]]
-    df["LOCATION_NAME"] = df["법정동명"].astype(str) + " " + df["지번"].astype(str)
-    df = df.rename(columns={"지목": "JIMOK"})
-    return df[["LOCATION_NAME", "JIMOK"]]
+        sql = f"""
+            SELECT jibun, pnu, ST_AsGeoJSON(ST_Transform(geom, 4326)) AS geometry
+            FROM solar_analysis.land_parcels
+            WHERE ST_DWithin(
+                geom,
+                ST_Transform(ST_SetSRID(ST_Point({lng}, {lat}), 4326), 5181),
+                1500
+            )
+            AND jibun IS NOT NULL
+        """
 
-df_land = load_landuse_csv()
+        cur.execute(sql)
+        rows = cur.fetchall()
 
-# ---------------- 세션 상태 초기화 ----------------
-if "map_center" not in st.session_state:
+        cur.close()
+        conn.close()
+
+        return rows
+
+    except Exception as e:
+        st.error(f"❌ 데이터베이스 연결 실패: {e}")
+        return []
+
+# 검색 처리 (자동 실행)
+if not st.session_state.search_triggered:
+    st.session_state.search_coords = DEFAULT_CENTER
     st.session_state.map_center = DEFAULT_CENTER
-if "search_coords" not in st.session_state:
-    st.session_state.search_coords = None
+    st.session_state.filtered_data = query_features(DEFAULT_CENTER[0], DEFAULT_CENTER[1])
+    st.session_state.search_triggered = True
 
-# ---------------- UI ----------------
-st.title("☀️ Solar Site Analysis")
-
-# 사이드바 지목 필터
-st.sidebar.header("🛑 회색으로 표시할 불가능 지목 선택")
-selected_disallowed = st.sidebar.multiselect(
-    "태양광 설치 제한 지목",
-    ALL_DISALLOWED_JIMOK,
-    default=ALL_DISALLOWED_JIMOK
-)
-
-# 주소 입력
-addr = st.text_input("📍 주소를 입력하세요")
-
-# ---------------- 주소 검색 및 중심 설정 ----------------
-if addr:
-    coords = geocode_cached(addr)
+if submitted and addr:
+    coords = geocode_address(addr)
     if coords:
         st.session_state.map_center = coords
         st.session_state.search_coords = coords
-        st.success(f"📍 좌표 변환 성공: 위도 {coords[0]:.6f}, 경도 {coords[1]:.6f}")
+        st.session_state.filtered_data = query_features(coords[0], coords[1])
+        st.success(f"📍 좌표: {coords[0]:.6f}, {coords[1]:.6f}")
     else:
-        st.error("❌ 주소 좌표를 찾을 수 없습니다.")
+        st.error("❌ 주소 좌표 변환 실패")
 
+map_center = st.session_state.search_coords if st.session_state.search_coords else st.session_state.map_center
 
-# ---------------- 지도 생성 ----------------
-m = folium.Map(location=st.session_state.map_center, zoom_start=15)
-tile_url = f"http://api.vworld.kr/req/wmts/1.0.0/{VWORLD_KEY}/Base/{{z}}/{{y}}/{{x}}.png"
-folium.TileLayer(tiles=tile_url, attr="VWorld").add_to(m)
+# 지도 초기화
+m = folium.Map(location=map_center, zoom_start=15)
 
-# ---------------- 지목 필터링 및 시각화 ----------------
-if st.session_state.search_coords:
-    lat, lng = st.session_state.search_coords
-    keyword = addr.split()[1] if len(addr.split()) > 1 else addr
+# 지도에 폴리곤 추가 (검색 유무 관계 없이 항상 실행)
+if st.session_state.filtered_data:
+    for row in st.session_state.filtered_data:
+        jibun, pnu, geojson = row
+        jimok = extract_jimok(jibun)
 
-    nearby = df_land[df_land["LOCATION_NAME"].str.contains(keyword, na=False)]
+        tooltip_text = f"{jibun}\nPNU: {pnu}"
 
-    if nearby.empty:
-        st.warning("⚠️ 해당 주소 근처에 지목 데이터가 없습니다.")
-    else:
-        for _, row in nearby.iterrows():
-            location = row["LOCATION_NAME"]
-            jimok = row["JIMOK"]
-            if jimok not in selected_disallowed:
-                continue
+        geometry = json.loads(geojson)
+        coords = geometry['coordinates'][0][0]
+        polygon = [[lat, lon] for lon, lat in coords]
 
-            coord = geocode_cached(location)
-            if coord:
-                folium.Circle(
-                    location=coord,
-                    radius=50,
-                    color="gray",
-                    fill=True,
-                    fill_opacity=0.4,
-                    tooltip=f"❌ {location} - {jimok} (설치 불가)"
-                ).add_to(m)
+        if jimok in selected_disallowed:
+            folium.Polygon(
+                locations=polygon,
+                color="red",
+                weight=3,
+                fill=True,
+                fill_color="#cccccc",
+                fill_opacity=0.4,
+                tooltip=f"❌ {tooltip_text}"
+            ).add_to(m)
+        else:
+            folium.Polygon(
+                locations=polygon,
+                color="green",
+                weight=2,
+                fill=True,
+                fill_color="#A8E6A3",
+                fill_opacity=0.3,
+                tooltip=f"✅ {tooltip_text}"
+            ).add_to(m)
 
-# ---------------- 지도 출력 ----------------
 st_folium(m, width=1000, height=600)
+
+if st.session_state.filtered_data:
+    st.info("✅ 주소 검색과 DB 기반 지목 필터링이 적용된 지도입니다.")
+else:
+    st.info("🔍 좌측에서 주소를 검색하면 필터링된 지도를 볼 수 있습니다.")

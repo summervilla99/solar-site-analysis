@@ -10,9 +10,27 @@ from config import VWORLD_KEY
 DEFAULT_CENTER = [37.5665, 126.9780]
 ALL_DISALLOWED_JIMOK = ["전", "답", "과", "염전", "임야", "양어장"]
 
+# ---------------- 지번+지목 추출 함수 ----------------
+def extract_jibun_and_jimok(jibun_jimok_raw):
+    jibun_jimok = jibun_jimok_raw.strip() if jibun_jimok_raw else ""
+
+    parts = jibun_jimok.split()
+    if len(parts) >= 2:
+        jibun = parts[0].strip()
+        jimok = parts[1].strip()
+        return jibun, jimok
+
+    match = re.match(r"([\d\-가-힣]+?)([가-힣]{1,3})$", jibun_jimok)
+    if match:
+        jibun = match.group(1).strip()
+        jimok = match.group(2).strip()
+        return jibun, jimok
+
+    return jibun_jimok, ""
+
 # ---------------- GML 파싱 함수 ----------------
 def parse_gml_features(xml_text):
-    namespace = {'gml': 'http://www.opengis.net/gml'}
+    namespace = {'gml': 'http://www.opengis.net/gml', 'sop': 'https://www.vworld.kr'}
     tree = ET.ElementTree(ET.fromstring(xml_text))
     root = tree.getroot()
 
@@ -27,38 +45,27 @@ def parse_gml_features(xml_text):
                 x, y = map(float, pair.split(","))
                 polygon.append([y, x])
 
-        jibun_jimok_text = member.find(".//lnm_lndcgr_smbol")
-        jibun_jimok = jibun_jimok_text.text if jibun_jimok_text is not None else ""
+        jibun_jimok_text = member.find(".//sop:lnm_lndcgr_smbol", namespace)
+        jibun_jimok_raw = jibun_jimok_text.text if jibun_jimok_text is not None else ""
 
-        pnu_text = member.find(".//pnu")
+        jibun, jimok = extract_jibun_and_jimok(jibun_jimok_raw)
+
+        pnu_text = member.find(".//sop:pnu", namespace)
         pnu = pnu_text.text if pnu_text is not None else ""
-
-        issue_code_text = member.find(".//issu_confm_code")
-        issue_code = issue_code_text.text if issue_code_text is not None else ""
-
-        if jibun_jimok:
-            jibun = ''.join(filter(lambda c: not ('\uAC00' <= c <= '\uD7A3'), jibun_jimok)).strip()
-            jimok = ''.join(filter(lambda c: ('\uAC00' <= c <= '\uD7A3'), jibun_jimok)).strip()
-        else:
-            jibun = ""
-            jimok = ""
 
         features.append({
             'polygon': polygon,
             'jibun': jibun,
             'jimok': jimok,
-            'pnu': pnu,
-            'issue_code': issue_code
+            'pnu': pnu
         })
 
     return features
 
 # ---------------- WFS API 호출 ----------------
-def fetch_cadastral_from_vworld(lat, lng):
-    buffer_km = 1.0  # ← 원하는 반경 km
-    buffer_deg = buffer_km / 111  # 위도 기준 1도 = 약 111km
+def fetch_cadastral_from_vworld(lat, lng, buffer_km=1.0):
+    buffer_deg = buffer_km / 111.0
     bbox = f"{lat - buffer_deg},{lng - buffer_deg},{lat + buffer_deg},{lng + buffer_deg},EPSG:4326"
-
 
     params = {
         "key": VWORLD_KEY,
@@ -72,17 +79,12 @@ def fetch_cadastral_from_vworld(lat, lng):
 
     try:
         res = requests.get("https://api.vworld.kr/ned/wfs/getCtnlgsSpceWFS", params=params, timeout=10)
+        xml_text = res.content.decode('utf-8', errors='replace')
 
-        # 우선 UTF-8 시도
-        try:
-            xml_text = res.content.decode('utf-8')
-        except UnicodeDecodeError:
-            xml_text = res.content.decode('euc-kr', errors='replace')
+        print("[DEBUG] 호출 URL:", res.url)
+        print("[DEBUG] 응답 코드:", res.status_code)
 
-        print("\n[DEBUG] 응답 일부 (디코딩 완료):")
-        print(xml_text[:1000])
-
-        st.text_area("📄 API 응답 (디코딩)", xml_text, height=200)
+        st.text_area("📄 API 응답", xml_text, height=200)
 
         if res.status_code == 200 and "<ServiceException" not in xml_text:
             return parse_gml_features(xml_text)
@@ -95,59 +97,55 @@ def fetch_cadastral_from_vworld(lat, lng):
         st.error(f"API 호출 실패: {e}")
         return []
 
-
-# ---------------- 세션 초기화 ----------------
+# ---------------- Streamlit 앱 ----------------
 if 'map_center' not in st.session_state:
     st.session_state.map_center = DEFAULT_CENTER
 if 'search_coords' not in st.session_state:
     st.session_state.search_coords = None
 
-# ---------------- UI ----------------
 st.title("☀️ Solar Site Analysis")
-
 selected_disallowed = st.sidebar.multiselect("🛑 태양광 불가 지목 선택", ALL_DISALLOWED_JIMOK, default=ALL_DISALLOWED_JIMOK)
+
 addr = st.text_input("📍 주소 입력")
 
-def geocode_address(addr):
-    for addr_type in ["road", "parcel"]:
-        params = {
-            "service": "address",
-            "request": "getcoord",
-            "format": "json",
-            "type": addr_type,
-            "key": VWORLD_KEY,
-            "address": addr,
-        }
-        try:
-            res = requests.get("https://api.vworld.kr/req/address", params=params, timeout=5)
-            data = res.json()
-            if data["response"]["status"] == "OK":
-                point = data["response"]["result"]["point"]
-                x = float(point["x"])
-                y = float(point["y"])
-                return [y, x]
-        except:
-            continue
-    return None
-
+# 주소 → 좌표 변환
 if addr:
+    def geocode_address(addr):
+        for addr_type in ["road", "parcel"]:
+            params = {
+                "service": "address",
+                "request": "getcoord",
+                "format": "json",
+                "type": addr_type,
+                "key": VWORLD_KEY,
+                "address": addr,
+            }
+            try:
+                res = requests.get("https://api.vworld.kr/req/address", params=params, timeout=5)
+                data = res.json()
+                if data["response"]["status"] == "OK":
+                    point = data["response"]["result"]["point"]
+                    return [float(point["y"]), float(point["x"])]
+            except:
+                continue
+        return None
+
     coords = geocode_address(addr)
     if coords:
         st.session_state.map_center = coords
         st.session_state.search_coords = coords
-        st.success(f"📍 주소 → 좌표: {coords[0]:.6f}, {coords[1]:.6f}")
+        st.success(f"📍 좌표: {coords[0]:.6f}, {coords[1]:.6f}")
     else:
-        st.error("❌ 주소 변환 실패")
+        st.error("❌ 주소 좌표 변환 실패")
 
-# ---------------- 지도 생성 ----------------
+# 지도 생성
 m = folium.Map(location=st.session_state.map_center, zoom_start=15)
-tile_url = f"http://api.vworld.kr/req/wmts/1.0.0/{VWORLD_KEY}/Base/{{z}}/{{y}}/{{x}}.png"
-folium.TileLayer(tiles=tile_url, attr="VWorld").add_to(m)
+folium.TileLayer(tiles=f"http://api.vworld.kr/req/wmts/1.0.0/{VWORLD_KEY}/Base/{{z}}/{{y}}/{{x}}.png", attr="VWorld").add_to(m)
 
 features = []
 if st.session_state.search_coords:
     lat, lng = st.session_state.search_coords
-    features = fetch_cadastral_from_vworld(lat, lng)
+    features = fetch_cadastral_from_vworld(lat, lng, buffer_km=1.0)
 
     for feature in features:
         jimok = feature['jimok']
@@ -157,19 +155,20 @@ if st.session_state.search_coords:
 
         tooltip_text = f"{jibun} - {jimok}\nPNU: {pnu}"
 
+        if not polygon:
+            continue
+
         if jimok in selected_disallowed:
-            # ❌ 설치 불가 → 회색 폴리곤 + 빨간 테두리 + 네모 박스 추가
             folium.Polygon(
                 locations=polygon,
-                color="red",             # 두꺼운 빨간 테두리
+                color="red",
                 weight=3,
                 fill=True,
-                fill_color="#cccccc",    # 회색 채움
+                fill_color="#cccccc",
                 fill_opacity=0.4,
                 tooltip=f"❌ {tooltip_text}"
             ).add_to(m)
 
-            # ➕ 바운딩 박스 네모 추가 (더 눈에 띄게)
             lats = [pt[0] for pt in polygon]
             lngs = [pt[1] for pt in polygon]
             bbox_polygon = [
@@ -184,11 +183,10 @@ if st.session_state.search_coords:
                 color="red",
                 weight=2,
                 dash_array="5,5",
-                tooltip="🚫 설치 불가 영역 (Bounding Box)"
+                tooltip="🚫 설치 불가 영역"
             ).add_to(m)
 
         else:
-            # ✅ 설치 가능 → 초록 테두리 + 연두 채움
             folium.Polygon(
                 locations=polygon,
                 color="green",
@@ -199,8 +197,6 @@ if st.session_state.search_coords:
                 tooltip=f"✅ {tooltip_text}"
             ).add_to(m)
 
-
-
 st_folium(m, width=1000, height=600)
 
-st.info("✅ 지도 클릭 없이도 좌표 검색 → WFS 호출 → 터미널 + UI에 디버깅이 바로 나옵니다.")
+st.info("✅ 1km 반경 내 지목 필터링 및 시각화 완료. 불가 지역은 빨간색, 가능 지역은 초록색으로 표시됩니다.")
