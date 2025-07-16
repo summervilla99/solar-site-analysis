@@ -4,10 +4,11 @@ import psycopg2
 import json
 import re
 from streamlit_folium import st_folium
+from pyproj import Transformer
 from config import DB_HOST, DB_NAME, DB_USER, DB_PASS, DB_PORT, VWORLD_KEY
 
 # 기본 설정
-DEFAULT_CENTER = [36.9910, 127.9260]  # 충주시 중심 좌표
+DEFAULT_CENTER = [37.8740, 127.9460]  # 충주시 중심 좌표
 ALL_DISALLOWED_JIMOK = ["전", "답", "과", "염전", "임야", "양어장"]
 
 # 세션 상태 초기화
@@ -58,8 +59,16 @@ def extract_jimok(jibun_value):
             return match.group(1)
     return ""
 
-# DB 쿼리 함수 (데이터만 반환)
+
+def convert_to_5181(lat, lng):
+    transformer = Transformer.from_crs("EPSG:4326", "EPSG:5181", always_xy=True)
+    x, y = transformer.transform(lng, lat)
+    return x, y
+
+# DB 쿼리 함수
 def query_features(lat, lng):
+    print(f"[DB QUERY] 요청 좌표: lat={lat}, lng={lng}")
+
     try:
         conn = psycopg2.connect(
             host=DB_HOST,
@@ -68,11 +77,13 @@ def query_features(lat, lng):
             password=DB_PASS,
             port=DB_PORT
         )
+        print("[DB CONNECT] 연결 성공")
+
         cur = conn.cursor()
 
         sql = f"""
             SELECT jibun, pnu, ST_AsGeoJSON(ST_Transform(geom, 4326)) AS geometry
-            FROM solar_analysis.land_parcels
+            FROM filter.land_category
             WHERE ST_DWithin(
                 geom,
                 ST_Transform(ST_SetSRID(ST_Point({lng}, {lat}), 4326), 5181),
@@ -81,8 +92,10 @@ def query_features(lat, lng):
             AND jibun IS NOT NULL
         """
 
+        print("[DB QUERY] 실행 중...")
         cur.execute(sql)
         rows = cur.fetchall()
+        print(f"[DB RESULT] 행 개수: {len(rows)}")
 
         cur.close()
         conn.close()
@@ -90,10 +103,12 @@ def query_features(lat, lng):
         return rows
 
     except Exception as e:
+        print(f"[DB ERROR] {e}")
         st.error(f"❌ 데이터베이스 연결 실패: {e}")
         return []
 
-# 검색 처리 (자동 실행)
+
+# 검색 처리
 if not st.session_state.search_triggered:
     st.session_state.search_coords = DEFAULT_CENTER
     st.session_state.map_center = DEFAULT_CENTER
@@ -115,38 +130,52 @@ map_center = st.session_state.search_coords if st.session_state.search_coords el
 # 지도 초기화
 m = folium.Map(location=map_center, zoom_start=15)
 
-# 지도에 폴리곤 추가 (검색 유무 관계 없이 항상 실행)
+# 지도에 폴리곤 추가 + 디버깅
 if st.session_state.filtered_data:
+
     for row in st.session_state.filtered_data:
         jibun, pnu, geojson = row
         jimok = extract_jimok(jibun)
-
         tooltip_text = f"{jibun}\nPNU: {pnu}"
 
-        geometry = json.loads(geojson)
-        coords = geometry['coordinates'][0][0]
-        polygon = [[lat, lon] for lon, lat in coords]
+        try:
+            geometry = json.loads(geojson)
+            geom_type = geometry.get("type")
 
-        if jimok in selected_disallowed:
-            folium.Polygon(
-                locations=polygon,
-                color="red",
-                weight=3,
-                fill=True,
-                fill_color="#cccccc",
-                fill_opacity=0.4,
-                tooltip=f"❌ {tooltip_text}"
-            ).add_to(m)
-        else:
-            folium.Polygon(
-                locations=polygon,
-                color="green",
-                weight=2,
-                fill=True,
-                fill_color="#A8E6A3",
-                fill_opacity=0.3,
-                tooltip=f"✅ {tooltip_text}"
-            ).add_to(m)
+            if geom_type == "Polygon":
+                polygons = [geometry["coordinates"]]
+            elif geom_type == "MultiPolygon":
+                polygons = geometry["coordinates"]
+            else:
+                continue  # 예외 구조는 건너뜀
+
+            for poly in polygons:
+                outer_ring = poly[0]
+                polygon = [[lat, lon] for lon, lat in outer_ring]
+
+                if jimok in selected_disallowed:
+                    folium.Polygon(
+                        locations=polygon,
+                        color="red",
+                        weight=3,
+                        fill=True,
+                        fill_color="#cccccc",
+                        fill_opacity=0.4,
+                        tooltip=f"❌ {tooltip_text}"
+                    ).add_to(m)
+                else:
+                    folium.Polygon(
+                        locations=polygon,
+                        color="green",
+                        weight=2,
+                        fill=True,
+                        fill_color="#A8E6A3",
+                        fill_opacity=0.3,
+                        tooltip=f"✅ {tooltip_text}"
+                    ).add_to(m)
+
+        except Exception as e:
+            st.warning(f"❗ 지오메트리 파싱 실패: {e}")
 
 st_folium(m, width=1000, height=600)
 

@@ -1,7 +1,7 @@
 import geopandas as gpd
 
 # SHP 파일 불러오기
-gdf = gpd.read_file('data/LSMD_CONT_LDREG_43130_202506.dbf')
+gdf = gpd.read_file('data/충북_청주시_청원구/LSMD_CONT_LDREG_43114_202507.dbf')
 
 # 컬럼 목록 확인
 print(gdf.columns)
