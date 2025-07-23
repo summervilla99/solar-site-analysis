@@ -3,15 +3,14 @@ import folium
 import psycopg2
 import json
 import re
+import time
 from streamlit_folium import st_folium
 from pyproj import Transformer
 from config import DB_HOST, DB_NAME, DB_USER, DB_PASS, DB_PORT, VWORLD_KEY
 
-# 기본 설정
-DEFAULT_CENTER = [37.8740, 127.9460]  # 충주시 중심 좌표
+DEFAULT_CENTER = [37.8740, 127.9460]
 ALL_DISALLOWED_JIMOK = ["전", "답", "과", "염전", "임야", "양어장"]
 
-# 세션 상태 초기화
 if 'map_center' not in st.session_state:
     st.session_state.map_center = DEFAULT_CENTER
 if 'search_coords' not in st.session_state:
@@ -21,15 +20,13 @@ if 'search_triggered' not in st.session_state:
 if 'filtered_data' not in st.session_state:
     st.session_state.filtered_data = None
 
-st.title("\u2600\ufe0f Solar Site Analysis (DB 기반 지목 필터링)")
+st.title("☀️ Solar Site Analysis (DB 기반 지목 필터링)")
 selected_disallowed = st.sidebar.multiselect("🛑 태양광 불가 지목 선택", ALL_DISALLOWED_JIMOK, default=ALL_DISALLOWED_JIMOK)
 
-# 주소 입력 및 검색
 with st.form("search_form"):
     addr = st.text_input("📍 주소 입력", key="address_input")
     submitted = st.form_submit_button("🔍 검색")
 
-# 주소 → 좌표 변환
 def geocode_address(addr):
     import requests
     for addr_type in ["road", "parcel"]:
@@ -46,12 +43,14 @@ def geocode_address(addr):
             data = res.json()
             if data["response"]["status"] == "OK":
                 point = data["response"]["result"]["point"]
-                return [float(point["y"]), float(point["x"])]
-        except:
+                coords = [float(point["y"]), float(point["x"])]
+                print(f"[DEBUG] 변환된 좌표: {coords}")
+                return coords
+        except Exception as e:
+            print(f"[DEBUG] 주소 변환 실패: {e}")
             continue
     return None
 
-# 지목 추출 함수
 def extract_jimok(jibun_value):
     if jibun_value:
         match = re.search(r'([가-힣]{1,3})$', jibun_value.strip())
@@ -59,16 +58,7 @@ def extract_jimok(jibun_value):
             return match.group(1)
     return ""
 
-
-def convert_to_5181(lat, lng):
-    transformer = Transformer.from_crs("EPSG:4326", "EPSG:5181", always_xy=True)
-    x, y = transformer.transform(lng, lat)
-    return x, y
-
-# DB 쿼리 함수
 def query_features(lat, lng):
-    print(f"[DB QUERY] 요청 좌표: lat={lat}, lng={lng}")
-
     try:
         conn = psycopg2.connect(
             host=DB_HOST,
@@ -77,10 +67,7 @@ def query_features(lat, lng):
             password=DB_PASS,
             port=DB_PORT
         )
-        print("[DB CONNECT] 연결 성공")
-
         cur = conn.cursor()
-
         sql = f"""
             SELECT jibun, pnu, ST_AsGeoJSON(ST_Transform(geom, 4326)) AS geometry
             FROM filter.land_category
@@ -91,95 +78,79 @@ def query_features(lat, lng):
             )
             AND jibun IS NOT NULL
         """
-
-        print("[DB QUERY] 실행 중...")
         cur.execute(sql)
         rows = cur.fetchall()
-        print(f"[DB RESULT] 행 개수: {len(rows)}")
-
         cur.close()
         conn.close()
-
         return rows
-
     except Exception as e:
         print(f"[DB ERROR] {e}")
         st.error(f"❌ 데이터베이스 연결 실패: {e}")
         return []
 
-
-# 검색 처리
-if not st.session_state.search_triggered:
+# 최초 로딩이거나 검색 전일 때 → 디폴트 필지 한 번만 불러오기
+if not st.session_state.filtered_data:
     st.session_state.search_coords = DEFAULT_CENTER
     st.session_state.map_center = DEFAULT_CENTER
     st.session_state.filtered_data = query_features(DEFAULT_CENTER[0], DEFAULT_CENTER[1])
-    st.session_state.search_triggered = True
+
+if 'drawn' not in st.session_state:
+    st.session_state.drawn = False
 
 if submitted and addr:
     coords = geocode_address(addr)
     if coords:
-        st.session_state.map_center = coords
+        lat, lng = coords
+        st.session_state.map_center = coords[1], coords[0]
         st.session_state.search_coords = coords
-        st.session_state.filtered_data = query_features(coords[0], coords[1])
-        st.success(f"📍 좌표: {coords[0]:.6f}, {coords[1]:.6f}")
+        st.session_state.filtered_data = query_features(lat, lng)
+        st.session_state.search_triggered = True
+        st.success(f"📍 좌표: {lat:.6f}, {lng:.6f}")
     else:
         st.error("❌ 주소 좌표 변환 실패")
 
-map_center = st.session_state.search_coords if st.session_state.search_coords else st.session_state.map_center
 
-# 지도 초기화
+map_center = st.session_state.search_coords if st.session_state.search_coords else st.session_state.map_center
 m = folium.Map(location=map_center, zoom_start=15)
 
-# 지도에 폴리곤 추가 + 디버깅
 if st.session_state.filtered_data:
+    with st.spinner("🔍 지도를 분석 중입니다. 필지 시각화까지 수 초 걸릴 수 있습니다..."):
+        start = time.time()
+        for row in st.session_state.filtered_data:
+            jibun, pnu, geojson = row
+            jimok = extract_jimok(jibun)
+            tooltip_text = f"{jibun}\nPNU: {pnu}"
 
-    for row in st.session_state.filtered_data:
-        jibun, pnu, geojson = row
-        jimok = extract_jimok(jibun)
-        tooltip_text = f"{jibun}\nPNU: {pnu}"
-
-        try:
-            geometry = json.loads(geojson)
-            geom_type = geometry.get("type")
-
-            if geom_type == "Polygon":
-                polygons = [geometry["coordinates"]]
-            elif geom_type == "MultiPolygon":
-                polygons = geometry["coordinates"]
-            else:
-                continue  # 예외 구조는 건너뜀
-
-            for poly in polygons:
-                outer_ring = poly[0]
-                polygon = [[lat, lon] for lon, lat in outer_ring]
-
-                if jimok in selected_disallowed:
-                    folium.Polygon(
-                        locations=polygon,
-                        color="red",
-                        weight=3,
-                        fill=True,
-                        fill_color="#cccccc",
-                        fill_opacity=0.4,
-                        tooltip=f"❌ {tooltip_text}"
-                    ).add_to(m)
+            try:
+                geometry = json.loads(geojson)
+                geom_type = geometry.get("type")
+                if geom_type == "Polygon":
+                    polygons = [geometry["coordinates"]]
+                elif geom_type == "MultiPolygon":
+                    polygons = geometry["coordinates"]
                 else:
+                    continue
+
+                for poly in polygons:
+                    outer_ring = poly[0]
+                    polygon = [[lat, lon] for lon, lat in outer_ring]
                     folium.Polygon(
                         locations=polygon,
-                        color="green",
-                        weight=2,
+                        color="red" if jimok in selected_disallowed else "green",
+                        weight=3 if jimok in selected_disallowed else 2,
                         fill=True,
-                        fill_color="#A8E6A3",
-                        fill_opacity=0.3,
-                        tooltip=f"✅ {tooltip_text}"
+                        fill_color="#cccccc" if jimok in selected_disallowed else "#A8E6A3",
+                        fill_opacity=0.4 if jimok in selected_disallowed else 0.3,
+                        tooltip=f"{'❌' if jimok in selected_disallowed else '✅'} {tooltip_text}"
                     ).add_to(m)
-
-        except Exception as e:
-            st.warning(f"❗ 지오메트리 파싱 실패: {e}")
+            except Exception as e:
+                st.warning(f"❗ 지오메트리 파싱 실패: {e}")
+        end = time.time()
+        print(f"[렌더링 시간] {end - start:.2f}초")
 
 st_folium(m, width=1000, height=600)
 
 if st.session_state.filtered_data:
-    st.info("✅ 주소 검색과 DB 기반 지목 필터링이 적용된 지도입니다.")
+    st.info("✅ 주소 기반 필지가 시각화되었습니다.")
 else:
-    st.info("🔍 좌측에서 주소를 검색하면 필터링된 지도를 볼 수 있습니다.")
+    st.info("🔍 주소를 검색하면 주변 필지를 확인할 수 있습니다.")
